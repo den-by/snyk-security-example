@@ -1,16 +1,21 @@
-name: Snyk Vulnerability Scan
+name: CI/CD Security & Quality
 
 on:
   push:
     branches: ['master', 'develop']
   pull_request:
     branches: ['master']
+  schedule:
+    - cron: '0 2 * * *' # Daily at 2 AM UTC
 
 permissions:
   contents: read
+  pull-requests: write
+  security-events: write
+  actions: read
 
 jobs:
-  snyk-scan:
+  code-quality:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout code
@@ -30,43 +35,185 @@ jobs:
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
 
-      - name: Run Snyk vulnerability scan
+      - name: Run linting
+        run: pnpm run lint
+
+      - name: Check formatting
+        run: pnpm run format:check
+
+      - name: Type check
+        run: pnpm run type-check
+
+      - name: Build TypeScript
+        run: pnpm build
+
+      - name: Run tests
+        run: pnpm test
+
+  security-scan:
+    runs-on: ubuntu-latest
+    # Run in parallel with code-quality for faster feedback
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 10.10.0
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '18'
+          cache: 'pnpm'
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Run Snyk security test
+        id: snyk
         uses: snyk/actions/node@master
         continue-on-error: true
         env:
           SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
         with:
-          args: --json-file-output=snyk-report.json
+          args: >-
+            --severity-threshold=high 
+            --json-file-output=snyk-report.json
+            --sarif-file-output=snyk.sarif
 
-      - name: Display vulnerability counts
-        if: always()
+      - name: Upload SARIF to GitHub Security
+        uses: github/codeql-action/upload-sarif@v3
+        if: always() && steps.snyk.outcome != 'skipped'
+        with:
+          sarif_file: snyk.sarif
+
+      - name: Monitor dependencies (non-PR only)
+        if: github.event_name != 'pull_request' && steps.snyk.outcome == 'success'
+        uses: snyk/actions/node@master
+        env:
+          SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
+        with:
+          command: monitor
+          args: --project-name=${{ github.repository }}
+
+      - name: Parse vulnerability results
+        id: parse-results
+        if: always() && steps.snyk.outcome != 'skipped'
         run: |
-          echo "## 🔒 Snyk Vulnerability Scan Results"
-          echo ""
-
           if [ -f snyk-report.json ]; then
-            # Extract vulnerability counts by severity
-            critical=$(jq '[.vulnerabilities[] | select(.severity=="critical")] | length' snyk-report.json 2>/dev/null || echo "0")
-            high=$(jq '[.vulnerabilities[] | select(.severity=="high")] | length' snyk-report.json 2>/dev/null || echo "0")
-            medium=$(jq '[.vulnerabilities[] | select(.severity=="medium")] | length' snyk-report.json 2>/dev/null || echo "0")
-            low=$(jq '[.vulnerabilities[] | select(.severity=="low")] | length' snyk-report.json 2>/dev/null || echo "0")
+            critical=$(jq '[.vulnerabilities[] | select(.severity=="critical")] | length' snyk-report.json || echo "0")
+            high=$(jq '[.vulnerabilities[] | select(.severity=="high")] | length' snyk-report.json || echo "0")
+            medium=$(jq '[.vulnerabilities[] | select(.severity=="medium")] | length' snyk-report.json || echo "0")
+            low=$(jq '[.vulnerabilities[] | select(.severity=="low")] | length' snyk-report.json || echo "0")
             
-            # Display counts in workflow log
-            echo "### Vulnerability Counts by Severity:"
-            echo "- 🔴 Critical: $critical"
-            echo "- 🟠 High: $high"
-            echo "- 🟡 Medium: $medium"
-            echo "- 🟢 Low: $low"
-            echo ""
-            echo "Total vulnerabilities: $((critical + high + medium + low))"
+            echo "critical=$critical" >> $GITHUB_OUTPUT
+            echo "high=$high" >> $GITHUB_OUTPUT
+            echo "medium=$medium" >> $GITHUB_OUTPUT
+            echo "low=$low" >> $GITHUB_OUTPUT
+            echo "total=$((critical + high + medium + low))" >> $GITHUB_OUTPUT
+            
+            # Fail if critical or high vulnerabilities found
+            if [ $critical -gt 0 ] || [ $high -gt 0 ]; then
+              echo "has_critical_high=true" >> $GITHUB_OUTPUT
+            else
+              echo "has_critical_high=false" >> $GITHUB_OUTPUT
+            fi
           else
-            echo "⚠️ Snyk report file not found"
+            echo "No Snyk report found"
+            echo "has_critical_high=false" >> $GITHUB_OUTPUT
           fi
 
-      - name: Upload Snyk report
+      - name: Create PR comment
+        uses: actions/github-script@v7
+        if: github.event_name == 'pull_request' && always() && steps.snyk.outcome != 'skipped'
+        with:
+          script: |
+            const critical = parseInt('${{ steps.parse-results.outputs.critical }}' || '0');
+            const high = parseInt('${{ steps.parse-results.outputs.high }}' || '0');
+            const medium = parseInt('${{ steps.parse-results.outputs.medium }}' || '0');
+            const low = parseInt('${{ steps.parse-results.outputs.low }}' || '0');
+            const total = parseInt('${{ steps.parse-results.outputs.total }}' || '0');
+            const hasCriticalHigh = '${{ steps.parse-results.outputs.has_critical_high }}' === 'true';
+            
+            let comment = `## 🔒 Security Scan Results\n\n`;
+            comment += `| Severity | Count |\n`;
+            comment += `|----------|-------|\n`;
+            comment += `| 🔴 Critical | ${critical} |\n`;
+            comment += `| 🟠 High | ${high} |\n`;
+            comment += `| 🟡 Medium | ${medium} |\n`;
+            comment += `| 🟢 Low | ${low} |\n\n`;
+            comment += `**Total vulnerabilities:** ${total}\n\n`;
+            
+            if (hasCriticalHigh) {
+              comment += `❌ **Action Required**: Critical or high severity vulnerabilities found!\n`;
+              comment += `Please review the [Security tab](https://github.com/${{ github.repository }}/security/code-scanning) for details.\n`;
+            } else {
+              comment += `✅ **Great!** No critical or high severity vulnerabilities found.\n`;
+            }
+            
+            comment += `\n---\n`;
+            comment += `*Powered by [Snyk](https://snyk.io) • [View full report](https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }})*`;
+
+            // Find and update existing comment or create new one
+            const { data: comments } = await github.rest.issues.listComments({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+            });
+
+            const botComment = comments.find(comment => 
+              comment.user.type === 'Bot' && comment.body.includes('🔒 Security Scan Results')
+            );
+
+            if (botComment) {
+              await github.rest.issues.updateComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                comment_id: botComment.id,
+                body: comment
+              });
+            } else {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: context.issue.number,
+                body: comment
+              });
+            }
+
+      - name: Fail if critical/high vulnerabilities
+        if: steps.parse-results.outputs.has_critical_high == 'true'
+        run: |
+          echo "::error::Build failed due to critical or high severity vulnerabilities"
+          exit 1
+
+      - name: Upload security scan results
         uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: snyk-report
-          path: snyk-report.json
+          name: security-scan-${{ github.event_name }}-${{ github.run_id }}
+          path: |
+            snyk-report.json
+            snyk.sarif
           retention-days: 30
+
+  scheduled-notification:
+    if: github.event_name == 'schedule'
+    needs: [code-quality, security-scan]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Create issue for scheduled scan results
+        uses: actions/github-script@v7
+        if: failure()
+        with:
+          script: |
+            const date = new Date().toISOString().split('T')[0];
+            const issue = await github.rest.issues.create({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              title: `🚨 Scheduled security scan failed - ${date}`,
+              body: `The scheduled security scan has detected vulnerabilities or quality issues.\n\n[View workflow run](https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }})\n\nPlease review and address the issues.`,
+              labels: ['security', 'automated']
+            });
