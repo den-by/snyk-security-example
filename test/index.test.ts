@@ -8,3 +8,7 @@ test('basic test', () => {
 test('string test', () => {
   assert.strictEqual('hello', 'hello');
 });
+
+test('boolean test', () => {
+  assert.strictEqual(true, true);
+});
