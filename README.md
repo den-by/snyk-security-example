@@ -66,7 +66,7 @@ The project includes two workflows:
 
 **`snyk-security.yml`**:
 
-- Runs on push to main/develop branches
+- Runs on push to master/develop branches
 - Scheduled daily scans at 2 AM UTC
 - Fails builds on critical/high vulnerabilities
 - Uploads SARIF results to GitHub Security tab
@@ -74,7 +74,7 @@ The project includes two workflows:
 
 **`pull-request.yml`**:
 
-- Runs on pull requests to main
+- Runs on pull requests to master
 - Comments security scan results on PRs
 - Shows vulnerability breakdown by severity
 - Uploads scan results as artifacts
@@ -123,7 +123,7 @@ Run `pnpm security:test` to see detected vulnerabilities.
 
 The workflows support:
 
-- **Branch Protection**: Different rules for main vs feature branches
+- **Branch Protection**: Different rules for master vs feature branches
 - **Scheduled Scans**: Configurable cron schedules
 - **Severity Thresholds**: Customizable failure conditions
 - **Multiple Formats**: JSON, SARIF, and summary outputs
@@ -156,11 +156,6 @@ ignore:
         reason: 'This vulnerability is not applicable to our use case'
         expires: '2025-12-31T23:59:59.999Z'
 ```
-
-## 📈 Monitoring Dashboard
-
-After running `pnpm security:monitor`, view your project at:
-`https://app.snyk.io/org/your-org/projects`
 
 ## 📚 Learn More
 
